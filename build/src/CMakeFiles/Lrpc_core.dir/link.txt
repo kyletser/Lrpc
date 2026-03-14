@@ -1,0 +1,2 @@
+/usr/bin/ar qc libLrpc_core.a CMakeFiles/Lrpc_core.dir/Lrpcapplication.cc.o CMakeFiles/Lrpc_core.dir/Lrpcchannel.cc.o CMakeFiles/Lrpc_core.dir/Lrpcconfig.cc.o CMakeFiles/Lrpc_core.dir/Lrpccontroller.cc.o CMakeFiles/Lrpc_core.dir/Lrpcheader.pb.cc.o CMakeFiles/Lrpc_core.dir/Lrpcprovider.cc.o CMakeFiles/Lrpc_core.dir/zookeeperutil.cc.o
+/usr/bin/ranlib libLrpc_core.a

@@ -1,0 +1,7 @@
+build/
+bin/client
+bin/server
+*.o
+*.a
+*.so
+*.log
