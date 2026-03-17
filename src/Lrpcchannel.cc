@@ -26,7 +26,7 @@
 
 std::mutex g_data_mutx;  // 全局互斥锁，用于保护共享数据的线程安全
 
-
+// 辅助函数：循环发送直到发送完所有数据
 ssize_t LrpcChannel::send_exact(int fd, const char* buf, size_t size) {
     size_t total_sent = 0;
     while (total_sent < size) {

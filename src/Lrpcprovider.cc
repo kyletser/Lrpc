@@ -66,7 +66,7 @@ void LrpcProvider::NotifyService(google::protobuf::Service *service) {
     service_map.emplace(service_name, service_info);  // 将服务信息存入服务map
 }
 
-// 启动RPC服务节点，开始提供远程网络调用服务
+// 启动RPC服务节点，开始提供远程网络调用服务，并将服务注册到ZooKeeper上，以便客户端能够发现和调用这些服务。
 void LrpcProvider::Run() {
     // 读取配置文件中的RPC服务器IP和端口
     std::string ip = LrpcApplication::GetInstance().GetConfig().Load("rpcserverip");
