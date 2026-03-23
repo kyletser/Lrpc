@@ -3,13 +3,6 @@
     *
     * Created on: 2026年3月5日
     * Author:LXP
-    * Description: 负责RPC调用的核心逻辑，包括连接服务器、序列化请求、发送数据、接收响应和反序列化响应
-    * 核心方法是CallMethod，负责将客户端的请求序列化并发送到服务端，同时接收服务端的响应，并将响应反序列化后返回给客户端
-    * 还包括辅助方法newConnect用于创建新的socket连接，QueryServiceHost用于从ZooKeeper查询服务地址，以及send_exact和recv_exact用于确保发送和接收数据的完整性
-    * 在CallMethod中，首先检查是否已经连接服务器，如果没有连接，则从ZooKeeper查询服务地址并尝试连接服务器。然后将请求参数序列化，构建协议头，并按照指定格式打包数据发送到服务器。最后接收服务器的响应，反序列化响应数据，并返回给客户端。
-    * 在连接服务器和查询服务地址的过程中，使用了日志记录错误和成功的信息，确保在发生错误时能够及时发现和定位问题。
-    * 在发送和接收数据时，使用了send_exact和recv_exact方法，确保数据的完整性，避免由于网络问题导致的数据丢失或不完整。
-    * 总之，LrpcChannel类的实现提供了一个完整的RPC调用流程，从连接服务器到发送请求再到接收响应，涵盖了RPC通信的各个方面，并且在设计上考虑了错误处理、日志记录和线程安全等重要因素。
 */
 #include "Lrpcchannel.h"
 #include "Lrpcheader.pb.h"
@@ -17,16 +10,185 @@
 #include "Lrpcapplication.h"
 #include "Lrpccontroller.h"
 #include "memory"
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <errno.h>
+#include <cstring>
+#include <unordered_map>
+#include <unordered_set>
+#include <mutex>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include "LrpcLogger.h"
 
-std::mutex g_data_mutx;  // 全局互斥锁，用于保护共享数据的线程安全
+namespace {
 
-// 辅助函数：循环发送直到发送完所有数据
+using Clock = std::chrono::steady_clock;
+
+struct DiscoveryCacheEntry {
+    std::vector<std::string> hosts;
+    Clock::time_point expire_at;
+};
+
+std::mutex g_discovery_cache_mu;
+std::unordered_map<std::string, DiscoveryCacheEntry> g_discovery_cache;
+const std::chrono::milliseconds kDiscoveryCacheTtl(2000);
+
+ZkClient *GetSharedZkClient() {
+    static ZkClient zk_client;
+    static std::once_flag init_flag;
+
+    std::call_once(init_flag, [] {
+        zk_client.Start();
+    });
+
+    return &zk_client;
+}
+
+bool CreateConnectionByEndpoint(const std::string &endpoint, int &fd) {
+    size_t idx = endpoint.find(':');
+    if (idx == std::string::npos) {
+        return false;
+    }
+
+    std::string ip = endpoint.substr(0, idx);
+    uint16_t port = static_cast<uint16_t>(atoi(endpoint.substr(idx + 1).c_str()));
+
+    int clientfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (clientfd == -1) {
+        return false;
+    }
+
+    struct sockaddr_in server_addr;
+    std::memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = inet_addr(ip.c_str());
+
+    if (connect(clientfd, reinterpret_cast<struct sockaddr *>(&server_addr), sizeof(server_addr)) == -1) {
+        close(clientfd);
+        return false;
+    }
+
+    fd = clientfd;
+    return true;
+}
+
+class RpcConnectionPool {
+public:
+    static RpcConnectionPool &Instance() {
+        static RpcConnectionPool pool;
+        return pool;
+    }
+
+    int Acquire(const std::string &endpoint, int wait_ms) {
+        auto bucket = GetBucket(endpoint);
+        std::unique_lock<std::mutex> lock(bucket->mu);
+
+        while (true) {
+            if (!bucket->idle_fds.empty()) {
+                int fd = bucket->idle_fds.front();
+                bucket->idle_fds.pop_front();
+                bucket->busy_fds.insert(fd);
+                return fd;
+            }
+
+            if (bucket->total < max_per_endpoint_) {
+                ++bucket->total;
+                lock.unlock();
+
+                int fd = -1;
+                bool ok = CreateConnectionByEndpoint(endpoint, fd);
+
+                lock.lock();
+                if (ok) {
+                    bucket->busy_fds.insert(fd);
+                    return fd;
+                }
+
+                --bucket->total;
+                bucket->cv.notify_one();
+                return -1;
+            }
+
+            if (!bucket->cv.wait_for(lock,
+                                     std::chrono::milliseconds(wait_ms),
+                                     [bucket, this] {
+                                         return !bucket->idle_fds.empty() || bucket->total < max_per_endpoint_;
+                                     })) {
+                return -1;
+            }
+        }
+    }
+
+    void Release(const std::string &endpoint, int fd, bool healthy) {
+        auto bucket = GetBucket(endpoint);
+        std::lock_guard<std::mutex> lock(bucket->mu);
+
+        if (bucket->busy_fds.erase(fd) == 0) {
+            return;
+        }
+
+        if (healthy) {
+            bucket->idle_fds.push_back(fd);
+        } else {
+            close(fd);
+            --bucket->total;
+        }
+
+        bucket->cv.notify_one();
+    }
+
+private:
+    struct Bucket {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<int> idle_fds;
+        std::unordered_set<int> busy_fds;
+        int total{0};
+    };
+
+    std::shared_ptr<Bucket> GetBucket(const std::string &endpoint) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = buckets_.find(endpoint);
+        if (it != buckets_.end()) {
+            return it->second;
+        }
+
+        auto bucket = std::make_shared<Bucket>();
+        buckets_.emplace(endpoint, bucket);
+        return bucket;
+    }
+
+private:
+    std::mutex mu_;
+    std::unordered_map<std::string, std::shared_ptr<Bucket>> buckets_;
+    int max_per_endpoint_{64};
+};
+
+std::string PickEndpointByRoundRobin(const std::string &service_name,
+                                     const std::string &method_name,
+                                     const std::vector<std::string> &hosts) {
+    static std::mutex rr_mu;
+    static std::unordered_map<std::string, size_t> rr_index;
+
+    std::string key = service_name + "/" + method_name;
+    std::lock_guard<std::mutex> lock(rr_mu);
+    size_t &idx = rr_index[key];
+    std::string endpoint = hosts[idx % hosts.size()];
+    ++idx;
+    return endpoint;
+}
+
+std::string BuildServiceMethodKey(const std::string &service_name, const std::string &method_name) {
+    return service_name + "/" + method_name;
+}
+
+} // namespace
+
 ssize_t LrpcChannel::send_exact(int fd, const char* buf, size_t size) {
     size_t total_sent = 0;
     while (total_sent < size) {
@@ -41,60 +203,71 @@ ssize_t LrpcChannel::send_exact(int fd, const char* buf, size_t size) {
     return total_sent;
 }
 
-
-// 辅助函数：循环读取直到读够 size 字节
 ssize_t LrpcChannel::recv_exact(int fd, char* buf, size_t size) {
     size_t total_read = 0;
     while (total_read < size) {
         ssize_t ret = recv(fd, buf + total_read, size - total_read, 0);
-        if (ret == 0) return 0; // 对端关闭
+        if (ret == 0) return 0;
         if (ret == -1) {
-            if (errno == EINTR) continue; // 中断信号，继续读
-            return -1; // 错误
+            if (errno == EINTR) continue;
+            return -1;
         }
         total_read += ret;
     }
     return total_read;
 }
 
-// RPC调用的核心方法，负责将客户端的请求序列化并发送到服务端，同时接收服务端的响应
 void LrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
                              ::google::protobuf::RpcController *controller,
                              const ::google::protobuf::Message *request,
                              ::google::protobuf::Message *response,
                              ::google::protobuf::Closure *done)
 {
-    if (-1 == m_clientfd) {  // 如果客户端socket未初始化
-        // 获取服务对象名和方法名
-        const google::protobuf::ServiceDescriptor *sd = method->service();
-        service_name = sd->name();  // 服务名
-        method_name = method->name();  // 方法名
+    const google::protobuf::ServiceDescriptor *sd = method->service();
+    std::string service_name = sd->name();
+    std::string method_name = method->name();
 
-        // 客户端需要查询ZooKeeper，找到提供该服务的服务器地址
-        ZkClient zkCli;
-        zkCli.Start();  // 连接ZooKeeper服务器
-        std::string host_data = QueryServiceHost(&zkCli, service_name, method_name, m_idx);  // 查询服务地址
-        m_ip = host_data.substr(0, m_idx);  // 从查询结果中提取IP地址
-        m_port = atoi(host_data.substr(m_idx + 1, host_data.size() - m_idx).c_str());  // 从查询结果中提取端口号
+    ZkClient *zkCli = GetSharedZkClient();
 
-        // 尝试连接服务器
-        auto rt = newConnect(m_ip.c_str(), m_port);
-        if (!rt) {
-            LOG(ERROR) << "connect server error";  // 连接失败，记录错误日志
-            return;
-        } else {
-            LOG(INFO) << "connect server success";  // 连接成功，记录日志
+    std::vector<std::string> hosts;
+    std::string cache_key = BuildServiceMethodKey(service_name, method_name);
+    Clock::time_point now = Clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(g_discovery_cache_mu);
+        auto it = g_discovery_cache.find(cache_key);
+        if (it != g_discovery_cache.end() && it->second.expire_at > now) {
+            hosts = it->second.hosts;
         }
-    }  // endif
+    }
 
-     // 2. 序列化请求参数
-    std::string args_str;
-    if (!request->SerializeToString(&args_str)) {
-        controller->SetFailed("serialize request fail");
+    if (hosts.empty()) {
+        hosts = QueryServiceHosts(zkCli, service_name, method_name);
+        std::lock_guard<std::mutex> lock(g_discovery_cache_mu);
+        g_discovery_cache[cache_key] = DiscoveryCacheEntry{hosts, now + kDiscoveryCacheTtl};
+    }
+
+    if (hosts.empty()) {
+        controller->SetFailed("no available provider for " + service_name + "." + method_name);
         return;
     }
 
-    // 3. 构建协议头
+    std::string endpoint = PickEndpointByRoundRobin(service_name, method_name, hosts);
+    int fd = RpcConnectionPool::Instance().Acquire(endpoint, 1000);
+    if (fd < 0) {
+        controller->SetFailed("acquire pooled connection failed");
+        return;
+    }
+
+    bool healthy = true;
+
+    std::string args_str;
+    if (!request->SerializeToString(&args_str)) {
+        controller->SetFailed("serialize request fail");
+        RpcConnectionPool::Instance().Release(endpoint, fd, healthy);
+        return;
+    }
+
     Lrpc::RpcHeader Lrpcheader;
     Lrpcheader.set_service_name(service_name);
     Lrpcheader.set_method_name(method_name);
@@ -103,127 +276,86 @@ void LrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     std::string rpc_header_str;
     if (!Lrpcheader.SerializeToString(&rpc_header_str)) {
         controller->SetFailed("serialize rpc header error!");
+        RpcConnectionPool::Instance().Release(endpoint, fd, healthy);
         return;
     }
 
-    // 4. 打包数据发送
-    // 格式：[4B Total Len] + [4B Header Len] + [Header] + [Args]
-    
     uint32_t header_size = rpc_header_str.size();
-    uint32_t total_len = 4 + header_size + args_str.size(); // Total Len 包含 HeaderLen(4) + Header + Body
-    
-    // 转网络字节序
+    uint32_t total_len = 4 + header_size + args_str.size();
+
     uint32_t net_total_len = htonl(total_len);
     uint32_t net_header_len = htonl(header_size);
 
     std::string send_rpc_str;
     send_rpc_str.reserve(4 + 4 + header_size + args_str.size());
-    
+
     send_rpc_str.append((char*)&net_total_len, 4);
     send_rpc_str.append((char*)&net_header_len, 4);
     send_rpc_str.append(rpc_header_str);
     send_rpc_str.append(args_str);
 
-    // 发送
-    if (send_exact(m_clientfd, send_rpc_str.data(), send_rpc_str.size()) != static_cast<ssize_t>(send_rpc_str.size())) {
-        close(m_clientfd);
-        m_clientfd = -1; // 重置
+    if (send_exact(fd, send_rpc_str.data(), send_rpc_str.size()) != static_cast<ssize_t>(send_rpc_str.size())) {
+        healthy = false;
         controller->SetFailed("send error");
+        RpcConnectionPool::Instance().Release(endpoint, fd, healthy);
         return;
     }
 
-    // 5. 接收响应
-    // 格式：[4B Total Len] + [Response Data]
-    
-    // A. 先读4字节长度头
     uint32_t response_len = 0;
-    if (recv_exact(m_clientfd, (char*)&response_len, 4) != 4) {
-        close(m_clientfd);
-        m_clientfd = -1;
+    if (recv_exact(fd, (char*)&response_len, 4) != 4) {
+        healthy = false;
         controller->SetFailed("recv response length error");
+        RpcConnectionPool::Instance().Release(endpoint, fd, healthy);
         return;
     }
-    response_len = ntohl(response_len); // 转回主机字节序
+    response_len = ntohl(response_len);
 
-    // B. 根据长度读取Body
     std::vector<char> recv_buf(response_len);
-    if (recv_exact(m_clientfd, recv_buf.data(), response_len) != response_len) {
-        close(m_clientfd);
-        m_clientfd = -1;
+    if (recv_exact(fd, recv_buf.data(), response_len) != static_cast<ssize_t>(response_len)) {
+        healthy = false;
         controller->SetFailed("recv response body error");
+        RpcConnectionPool::Instance().Release(endpoint, fd, healthy);
         return;
     }
 
-    // 6. 反序列化响应
     if (!response->ParseFromArray(recv_buf.data(), response_len)) {
-        close(m_clientfd);
-        m_clientfd = -1;
+        healthy = false;
         controller->SetFailed("parse response error");
-        return;
-    }
-}
-
-// 创建新的socket连接
-bool LrpcChannel::newConnect(const char *ip, uint16_t port) {
-    // 创建socket
-    int clientfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (-1 == clientfd) {
-        char errtxt[512] = {0};
-        LOG(ERROR) << "socket error:" << errtxt;  // 记录错误日志
-        return false;
-    }
-
-    // 设置服务器地址信息
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;  // IPv4地址族
-    server_addr.sin_port = htons(port);  // 端口号
-    server_addr.sin_addr.s_addr = inet_addr(ip);  // IP地址
-
-    // 尝试连接服务器
-    if (-1 == connect(clientfd, (struct sockaddr *)&server_addr, sizeof(server_addr))) {
-        close(clientfd);  // 连接失败，关闭socket
-        char errtxt[512] = {0};
-        LOG(ERROR) << "connect server error" << errtxt;  // 记录错误日志
-        return false;
-    }
-
-    m_clientfd = clientfd;  // 保存socket文件描述符
-    return true;
-}
-
-// 从ZooKeeper查询服务地址
-std::string LrpcChannel::QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx) {
-    std::string method_path = "/" + service_name + "/" + method_name;  // 构造ZooKeeper路径
-
-    std::unique_lock<std::mutex> lock(g_data_mutx);  // 加锁，保证线程安全
-    std::string host_data_1 = zkclient->GetData(method_path.c_str());  // 从ZooKeeper获取数据
-    lock.unlock();  // 解锁
-
-    if (host_data_1 == "") {  // 如果未找到服务地址
-        LOG(ERROR) << method_path + " is not exist!";  // 记录错误日志
-        return " ";
-    }
-
-    idx = host_data_1.find(":");  // 查找IP和端口的分隔符
-    if (idx == -1) {  // 如果分隔符不存在
-        LOG(ERROR) << method_path + " address is invalid!";  // 记录错误日志
-        return " ";
-    }
-
-    return host_data_1;  // 返回服务地址
-}
-
-// 构造函数，支持延迟连接
-LrpcChannel::LrpcChannel(bool connectNow) : m_clientfd(-1), m_idx(0) {
-    if (!connectNow) {  // 如果不需要立即连接
+        RpcConnectionPool::Instance().Release(endpoint, fd, healthy);
         return;
     }
 
-    // 尝试连接服务器，最多重试3次
-    auto rt = newConnect(m_ip.c_str(), m_port);
-    int count = 3;  // 重试次数
-    while (!rt && count--) {
-        rt = newConnect(m_ip.c_str(), m_port);
+    RpcConnectionPool::Instance().Release(endpoint, fd, healthy);
+    if (done != nullptr) {
+        done->Run();
+    }
+}
+
+std::vector<std::string> LrpcChannel::QueryServiceHosts(ZkClient *zkclient,
+                                                         const std::string &service_name,
+                                                         const std::string &method_name) {
+    std::string method_path = "/" + service_name + "/" + method_name;
+    std::vector<std::string> hosts;
+
+    std::vector<std::string> children = zkclient->GetChildren(method_path.c_str());
+    for (const auto &child : children) {
+        std::string child_path = method_path + "/" + child;
+        std::string host = zkclient->GetData(child_path.c_str());
+        if (!host.empty() && host.find(':') != std::string::npos) {
+            hosts.emplace_back(host);
+        }
     }
 
+    if (hosts.empty()) {
+        std::string host = zkclient->GetData(method_path.c_str());
+        if (!host.empty() && host.find(':') != std::string::npos) {
+            hosts.emplace_back(host);
+        }
+    }
+
+    return hosts;
+}
+
+LrpcChannel::LrpcChannel(bool connectNow) {
+    (void)connectNow;
 }

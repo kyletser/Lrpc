@@ -315,6 +315,8 @@ src/CMakeFiles/Lrpc_core.dir/Lrpcchannel.cc.o: \
  /home/kyle/coding/Lrpc/src/include/Lrpcchannel.h \
  /home/kyle/coding/Lrpc/src/include/Lrpccontroller.h \
  /home/kyle/coding/Lrpc/src/include/Lrpccontroller.h \
+ /usr/include/c++/11/condition_variable /usr/include/c++/11/deque \
+ /usr/include/c++/11/bits/stl_deque.h /usr/include/c++/11/bits/deque.tcc \
  /usr/include/arpa/inet.h /usr/include/netinet/in.h \
  /usr/include/x86_64-linux-gnu/bits/in.h \
  /home/kyle/coding/Lrpc/src/include/LrpcLogger.h \

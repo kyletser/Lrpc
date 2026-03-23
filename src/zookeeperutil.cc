@@ -31,6 +31,8 @@ ZkClient::~ZkClient() {
 
 // 启动ZooKeeper客户端，连接ZooKeeper服务器
 void ZkClient::Start() {
+    zoo_set_debug_level(ZOO_LOG_LEVEL_WARN);
+
     // 从配置文件中读取ZooKeeper服务器的IP和端口
     std::string host = LrpcApplication::GetInstance().GetConfig().Load("zookeeperip");
     std::string port = LrpcApplication::GetInstance().GetConfig().Load("zookeeperport");
@@ -90,4 +92,22 @@ std::string ZkClient::GetData(const char *path) {
         return buf;  // 返回节点数据
     }
     return "";  // 默认返回空字符串
+}
+
+std::vector<std::string> ZkClient::GetChildren(const char *path) {
+    std::vector<std::string> children;
+    struct String_vector child_vector;
+
+    int flag = zoo_get_children(m_zhandle, path, 0, &child_vector);
+    if (flag != ZOK) {
+        return children;
+    }
+
+    children.reserve(child_vector.count);
+    for (int i = 0; i < child_vector.count; ++i) {
+        children.emplace_back(child_vector.data[i]);
+    }
+
+    deallocate_String_vector(&child_vector);
+    return children;
 }
